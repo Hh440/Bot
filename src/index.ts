@@ -1,0 +1,38 @@
+import { LAMPORTS_PER_SOL, clusterApiUrl } from "@solana/web3.js";
+import { ArbBot, SwapToken } from './bot';
+import dotenv from "dotenv";
+
+
+dotenv.config({
+    path:".env"
+})
+
+
+const defaultConfig={
+    solanaEndpoint:clusterApiUrl('mainnet-beta'),
+    jupiter: "https://quote-api.jup.ag/v6",
+}
+
+
+async function main(){
+    if(!process.env.SECRET_KEY){
+        throw new Error("SECRET_KEY ennvironment variable not set")
+    }
+
+    let decodeSecretKey= Uint8Array.from(JSON.parse(process.env.SECRET_KEY))
+
+    const bot = new ArbBot({
+        solanaEndpoint:process.env.SOLANA_ENDPOINT?? defaultConfig.solanaEndpoint,
+        metisEndpoint:process.env.METIS_ENDPOINT ?? defaultConfig.jupiter,
+        secretKey:decodeSecretKey,
+        firstTradePrice:0.11*LAMPORTS_PER_SOL,
+        targetGainPercentage:1.5,
+        initialInputToken:SwapToken.USDC,
+        initialInputAmount:10_000_000
+    })
+
+    await bot.init()
+}
+
+main().catch(console.error)
+
