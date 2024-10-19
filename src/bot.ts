@@ -1,5 +1,5 @@
-import { Keypair, Connection, PublicKey, VersionedTransaction, LAMPORTS_PER_SOL, TransactionInstruction, AddressLookupTableAccount, TransactionMessage, TransactionSignature, TransactionConfirmationStatus, SignatureStatus } from "@solana/web3.js";
-import { createJupiterApiClient, DefaultApi, ResponseError, QuoteGetRequest, QuoteResponse, Instruction, AccountMeta } from '@jup-ag/api';
+import { Keypair, Connection, PublicKey, VersionedTransaction, LAMPORTS_PER_SOL, TransactionInstruction, AddressLookupTableAccount, TransactionMessage, TransactionSignature, TransactionConfirmationStatus, SignatureStatus, MessageAccountKeys } from "@solana/web3.js";
+import { createJupiterApiClient, DefaultApi, ResponseError, QuoteGetRequest, QuoteResponse, Instruction, AccountMeta, BlobApiResponse } from '@jup-ag/api';
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import * as fs from 'fs';
 import * as path from 'path';
@@ -31,7 +31,7 @@ interface LogSwapArgs{
     outputToken:string;
     outAmount:string;
     txId:string;
-    timeStamp:string;
+    timestamp:string;
 }
 
 export class ArbBot{
@@ -186,26 +186,129 @@ export class ArbBot{
     }
        
     // function to confirm the transaction
-   /* private async confirmTransaction(
-        connection:Connection,
-        signature:TransactionSignature,
-        desiredConfirmationsStatus:TransactionConfirmationStatus='confirmed',
-        timeout:number=30000,
-        pollInterval:number=1000,
-        searchTransactionHistory:boolean=false
-    ):Promise<SignatureStatus>{
-        const start = Date.now()
+    private async confirmTransaction(
+        connection: Connection,
+        signature: TransactionSignature,
+        desiredConfirmationStatus: TransactionConfirmationStatus = 'confirmed',
+        timeout: number = 30000,
+        pollInterval: number = 1000,
+        searchTransactionHistory: boolean = false
+    ): Promise<SignatureStatus> {
+        const start = Date.now();
 
-        while(Date.now()-start<timeout){
-            const {value:statuses}=await connection.getSignatureStatus([signature],{searchTransactionHistory})
-            if(!statuses || statuses.length==0)
+        while (Date.now() - start < timeout) {
+            const { value: statuses } = await connection.getSignatureStatuses([signature], { searchTransactionHistory });
+
+            if (!statuses || statuses.length === 0) {
+                throw new Error('Failed to get signature status');
+            }
+
+            const status = statuses[0];
+
+            if (status === null) {
+                await new Promise(resolve => setTimeout(resolve, pollInterval));
+                continue;
+            }
+
+            if (status.err) {
+                throw new Error(`Transaction failed: ${JSON.stringify(status.err)}`);
+            }
+
+            if (status.confirmationStatus && status.confirmationStatus === desiredConfirmationStatus) {
+                return status;
+            }
+
+            if (status.confirmationStatus === 'finalized') {
+                return status;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, pollInterval));
         }
-    }
+
+        throw new Error(`Transaction confirmation timeout after ${timeout}ms`);
+    };
+  
+
+
+    /* if the bot detects that market conditions are appropriate to satisfy our requirments, we should execute the trade
+    steps:
+    1. fetch the swap instructions from jupiter's api
+    2. Refractor our recieved instructions data to transaction instructions
+    3. fetch the address lookup table accounts
+    4. create and send a Solana Transaction
+    5. On success, log the swap and update the next trade conditions
+    
+    
+    
     */
-
-
     private async executeSwap(route:QuoteResponse):Promise<void>{
-        //TODO
+        try{
+            const {
+                computeBudgetInstructions,
+                setupInstructions,
+                swapInstruction,
+                cleanupInstruction,
+                addressLookupTableAddresses,
+            } = await this.jupiterApi.swapInstructionsPost({
+                swapRequest: {
+                    quoteResponse: route,
+                    userPublicKey: this.wallet.publicKey.toBase58(),
+                    prioritizationFeeLamports: 'auto'
+                },
+            });
+
+
+            const instructions:TransactionInstruction[]=[
+                ...computeBudgetInstructions.map(this.instructionDataToTransactionInstruction),
+                ...setupInstructions.map(this.instructionDataToTransactionInstruction),
+                this.instructionDataToTransactionInstruction(swapInstruction),
+                this.instructionDataToTransactionInstruction(cleanupInstruction)
+            ].filter((ix)=>ix!==null)as  TransactionInstruction[]
+
+            
+            const addressLookupTableAccounts= await this.getAdressLookupTableAccounts(
+                addressLookupTableAddresses,
+                this.solanaConnection
+            )
+
+
+            const {blockhash,lastValidBlockHeight}=  await this.solanaConnection.getLatestBlockhash();
+
+            const messageV0= new TransactionMessage({
+                payerKey:this.wallet.publicKey,
+                recentBlockhash:blockhash,
+                instructions
+            }).compileToV0Message(addressLookupTableAccounts)
+
+            const transaction = new VersionedTransaction(messageV0)
+            transaction.sign([this.wallet])
+
+            const rawTransaction= transaction.serialize()
+
+            const txid = await this.solanaConnection.sendRawTransaction(rawTransaction,{
+                skipPreflight:true,
+                maxRetries:2
+            })
+
+
+           const confirmation = await this.confirmTransaction(this.solanaConnection,txid)
+
+           if(confirmation.err){
+            throw new Error('Transaction Failed')
+           }
+
+           await this.postTransactionProcessing(route,txid)
+        }catch(error){
+            if(error instanceof ResponseError){
+                console.log(await error.response.json())
+            }else{
+                console.error(error)
+            }
+
+            throw new Error('unable to execute swap')
+        }finally{
+            this.waitingForConfirmation=false
+        }
     }
 
     //upadte the arguments after the trade execution
@@ -220,33 +323,57 @@ export class ArbBot{
         }
     }
 
-    private async logSwap(args:LogSwapArgs):Promise<void>{
-        const {inputToken,inAmount,outputToken,outAmount,txId,timeStamp}=args;
-        const logEntry={
+    private async logSwap(args: LogSwapArgs): Promise<void> {
+        const { inputToken, inAmount, outputToken, outAmount, txId, timestamp } = args;
+        const logEntry = {
             inputToken,
             inAmount,
             outputToken,
             outAmount,
             txId,
-            timeStamp,
-        }
-
-        const filePath=path.join(__dirname,'trade.json')
-
-        try{
-            if(!fs.existsSync(filePath)){
-                fs.writeFileSync(filePath,JSON.stringify([logEntry],null,2),'utf-8')
-            }else{
-                const data= fs.readFileSync(filePath,{encoding:'utf-8'})
-                const trades=JSON.parse(data)
-                trades.push(logEntry)
-                fs.writeFileSync(filePath,JSON.stringify(trades,null,2),'utf-8');
+            timestamp,
+        };
+    
+        const filePath = path.join(__dirname, 'trades.json');
+        console.log("File path is:", filePath); // Log the file path
+    
+        try {
+            // Check if file exists
+            if (!fs.existsSync(filePath)) {
+                console.log(`File not found. Creating ${filePath}...`);
+                fs.writeFileSync(filePath, JSON.stringify([logEntry], null, 2), 'utf-8');
+                console.log("File created and log entry written successfully.");
+            } else {
+                console.log("File exists. Reading content...");
+                const data = fs.readFileSync(filePath, { encoding: 'utf-8' });
+                console.log("File content before update:", data); // Log the content of the file before parsing
+    
+                // Only parse if file is not empty
+                let trades;
+                if (data.trim()) {
+                    console.log("Parsing file content...");
+                    trades = JSON.parse(data);
+                    console.log("Parsed trades:", trades); // Log parsed trades array
+                } else {
+                    console.log("File is empty, initializing with empty array.");
+                    trades = [];
+                }
+    
+                trades.push(logEntry); // Add new log entry
+                console.log("Updated trades with new log entry:", trades); // Log updated trades
+    
+                // Write updated trades back to file
+                fs.writeFileSync(filePath, JSON.stringify(trades, null, 2), 'utf-8');
+                console.log("Log entry appended to file successfully.");
             }
-            console.log(`✅ Logged swap: ${inAmount} ${inputToken} -> ${outAmount} ${outputToken},\n  TX: ${txId}}`);
-        }catch(error){
-            console.log('Error logging swap:',error)
+    
+            console.log(`✅ Logged swap: ${inAmount} ${inputToken} -> ${outAmount} ${outputToken}, TX: ${txId}`);
+        } catch (error) {
+            console.error('Error logging swap:', error);
         }
     }
+    
+    
 
 
     private terminateSession(reason:string):void{
@@ -312,7 +439,7 @@ export class ArbBot{
         const {inputMint,inAmount,outputMint,outAmount}=quote
         await this.updateNextTrade(quote)
         await this.refreshBalances()
-        await this.logSwap({inputToken:inputMint,inAmount,outputToken:outputMint,outAmount,txId:txid,timeStamp:new Date().toISOString()})
+        await this.logSwap({inputToken:inputMint,inAmount,outputToken:outputMint,outAmount,txId:txid,timestamp:new Date().toISOString()})
     }
 }
 
