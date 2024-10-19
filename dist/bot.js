@@ -169,25 +169,93 @@ class ArbBot {
         });
     }
     // function to confirm the transaction
-    /* private async confirmTransaction(
-         connection:Connection,
-         signature:TransactionSignature,
-         desiredConfirmationsStatus:TransactionConfirmationStatus='confirmed',
-         timeout:number=30000,
-         pollInterval:number=1000,
-         searchTransactionHistory:boolean=false
-     ):Promise<SignatureStatus>{
-         const start = Date.now()
- 
-         while(Date.now()-start<timeout){
-             const {value:statuses}=await connection.getSignatureStatus([signature],{searchTransactionHistory})
-             if(!statuses || statuses.length==0)
-         }
-     }
-     */
+    confirmTransaction(connection_1, signature_1) {
+        return __awaiter(this, arguments, void 0, function* (connection, signature, desiredConfirmationStatus = 'confirmed', timeout = 30000, pollInterval = 1000, searchTransactionHistory = false) {
+            const start = Date.now();
+            while (Date.now() - start < timeout) {
+                const { value: statuses } = yield connection.getSignatureStatuses([signature], { searchTransactionHistory });
+                if (!statuses || statuses.length === 0) {
+                    throw new Error('Failed to get signature status');
+                }
+                const status = statuses[0];
+                if (status === null) {
+                    yield new Promise(resolve => setTimeout(resolve, pollInterval));
+                    continue;
+                }
+                if (status.err) {
+                    throw new Error(`Transaction failed: ${JSON.stringify(status.err)}`);
+                }
+                if (status.confirmationStatus && status.confirmationStatus === desiredConfirmationStatus) {
+                    return status;
+                }
+                if (status.confirmationStatus === 'finalized') {
+                    return status;
+                }
+                yield new Promise(resolve => setTimeout(resolve, pollInterval));
+            }
+            throw new Error(`Transaction confirmation timeout after ${timeout}ms`);
+        });
+    }
+    ;
+    /* if the bot detects that market conditions are appropriate to satisfy our requirments, we should execute the trade
+    steps:
+    1. fetch the swap instructions from jupiter's api
+    2. Refractor our recieved instructions data to transaction instructions
+    3. fetch the address lookup table accounts
+    4. create and send a Solana Transaction
+    5. On success, log the swap and update the next trade conditions
+    
+    
+    
+    */
     executeSwap(route) {
         return __awaiter(this, void 0, void 0, function* () {
-            //TODO
+            try {
+                const { computeBudgetInstructions, setupInstructions, swapInstruction, cleanupInstruction, addressLookupTableAddresses, } = yield this.jupiterApi.swapInstructionsPost({
+                    swapRequest: {
+                        quoteResponse: route,
+                        userPublicKey: this.wallet.publicKey.toBase58(),
+                        prioritizationFeeLamports: 'auto'
+                    },
+                });
+                const instructions = [
+                    ...computeBudgetInstructions.map(this.instructionDataToTransactionInstruction),
+                    ...setupInstructions.map(this.instructionDataToTransactionInstruction),
+                    this.instructionDataToTransactionInstruction(swapInstruction),
+                    this.instructionDataToTransactionInstruction(cleanupInstruction)
+                ].filter((ix) => ix !== null);
+                const addressLookupTableAccounts = yield this.getAdressLookupTableAccounts(addressLookupTableAddresses, this.solanaConnection);
+                const { blockhash, lastValidBlockHeight } = yield this.solanaConnection.getLatestBlockhash();
+                const messageV0 = new web3_js_1.TransactionMessage({
+                    payerKey: this.wallet.publicKey,
+                    recentBlockhash: blockhash,
+                    instructions
+                }).compileToV0Message(addressLookupTableAccounts);
+                const transaction = new web3_js_1.VersionedTransaction(messageV0);
+                transaction.sign([this.wallet]);
+                const rawTransaction = transaction.serialize();
+                const txid = yield this.solanaConnection.sendRawTransaction(rawTransaction, {
+                    skipPreflight: true,
+                    maxRetries: 2
+                });
+                const confirmation = yield this.confirmTransaction(this.solanaConnection, txid);
+                if (confirmation.err) {
+                    throw new Error('Transaction Failed');
+                }
+                yield this.postTransactionProcessing(route, txid);
+            }
+            catch (error) {
+                if (error instanceof api_1.ResponseError) {
+                    console.log(yield error.response.json());
+                }
+                else {
+                    console.error(error);
+                }
+                throw new Error('unable to execute swap');
+            }
+            finally {
+                this.waitingForConfirmation = false;
+            }
         });
     }
     //upadte the arguments after the trade execution
@@ -204,30 +272,49 @@ class ArbBot {
     }
     logSwap(args) {
         return __awaiter(this, void 0, void 0, function* () {
-            const { inputToken, inAmount, outputToken, outAmount, txId, timeStamp } = args;
+            const { inputToken, inAmount, outputToken, outAmount, txId, timestamp } = args;
             const logEntry = {
                 inputToken,
                 inAmount,
                 outputToken,
                 outAmount,
                 txId,
-                timeStamp,
+                timestamp,
             };
-            const filePath = path.join(__dirname, 'trade.json');
+            const filePath = path.join(__dirname, 'trades.json');
+            console.log("File path is:", filePath); // Log the file path
             try {
+                // Check if file exists
                 if (!fs.existsSync(filePath)) {
+                    console.log(`File not found. Creating ${filePath}...`);
                     fs.writeFileSync(filePath, JSON.stringify([logEntry], null, 2), 'utf-8');
+                    console.log("File created and log entry written successfully.");
                 }
                 else {
+                    console.log("File exists. Reading content...");
                     const data = fs.readFileSync(filePath, { encoding: 'utf-8' });
-                    const trades = JSON.parse(data);
-                    trades.push(logEntry);
+                    console.log("File content before update:", data); // Log the content of the file before parsing
+                    // Only parse if file is not empty
+                    let trades;
+                    if (data.trim()) {
+                        console.log("Parsing file content...");
+                        trades = JSON.parse(data);
+                        console.log("Parsed trades:", trades); // Log parsed trades array
+                    }
+                    else {
+                        console.log("File is empty, initializing with empty array.");
+                        trades = [];
+                    }
+                    trades.push(logEntry); // Add new log entry
+                    console.log("Updated trades with new log entry:", trades); // Log updated trades
+                    // Write updated trades back to file
                     fs.writeFileSync(filePath, JSON.stringify(trades, null, 2), 'utf-8');
+                    console.log("Log entry appended to file successfully.");
                 }
-                console.log(`✅ Logged swap: ${inAmount} ${inputToken} -> ${outAmount} ${outputToken},\n  TX: ${txId}}`);
+                console.log(`✅ Logged swap: ${inAmount} ${inputToken} -> ${outAmount} ${outputToken}, TX: ${txId}`);
             }
             catch (error) {
-                console.log('Error logging swap:', error);
+                console.error('Error logging swap:', error);
             }
         });
     }
@@ -278,7 +365,7 @@ class ArbBot {
             const { inputMint, inAmount, outputMint, outAmount } = quote;
             yield this.updateNextTrade(quote);
             yield this.refreshBalances();
-            yield this.logSwap({ inputToken: inputMint, inAmount, outputToken: outputMint, outAmount, txId: txid, timeStamp: new Date().toISOString() });
+            yield this.logSwap({ inputToken: inputMint, inAmount, outputToken: outputMint, outAmount, txId: txid, timestamp: new Date().toISOString() });
         });
     }
 }
