@@ -38,8 +38,8 @@ Before running the bot, ensure you have the following installed:
    ```
 4. Create a .env file in the root directory and add Configuration:
    ```bash
-   # Replace with your Your Solana wallet secret key
-   SECRET_KEY=[00, 00, ... 00]
+   # Replace with your Your Solana wallet private key
+   SECRET_KEY=6ASf5EcmmEHTgDJ4X4Z45vT6iHVJBXPg5AN5YoTCpGWt
    # Replace with your QuickNode Solana Mainnet RPC endpoint
    SOLANA_ENDPOINT=https://example.solana-mainnet.quiknode.pro/123456/
    # Replace with your QuickNode Jupiter API endpoint (or a public one: https://www.jupiterapi.com/)
