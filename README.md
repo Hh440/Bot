@@ -63,7 +63,7 @@ node dist/index.js
 - If conditions are met, it executes the swap.
 - The process repeats until manually stopped or until the specified conditions are no longer met.
 
-## Contribbuting
+## Contributing
 
 Contributions are welcome! Please follow these steps to contribute:
 
